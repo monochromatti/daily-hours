@@ -15,6 +15,8 @@ from rich.table import Table
 from rich.text import Text
 
 HOURS_PER_DAY = 24.0
+WORKING_DAY_START = 6.0
+WORKING_DAY_END = 17.0
 TIMELINE_WIDTH = 48
 TIMELINE_TICK_HOURS = 6
 TIMELINE_LABEL_HOURS = (0, 6, 12, 18, 24)
@@ -112,6 +114,14 @@ def calculate_daily_spans(
 
 def calculate_total_hours(spans: list[tuple[float, float]]) -> float:
     return sum(end - start for start, end in spans)
+
+
+def calculate_window_hours(
+    spans: list[tuple[float, float]], start_hour: float, end_hour: float
+) -> float:
+    return sum(
+        max(0.0, min(end, end_hour) - max(start, start_hour)) for start, end in spans
+    )
 
 
 class MultiBar:
@@ -251,14 +261,22 @@ def main() -> None:
     table = Table(show_header=True, header_style="bold")
     table.add_column("Day", style="cyan", no_wrap=True)
     table.add_column(header=build_timeline_labels())
-    table.add_column("Hours", justify="right", style="magenta")
+    table.add_column("Working hours", justify="right", style="magenta")
+    table.add_column("Total hours", justify="right", style="magenta")
 
     for day in display_days:
         spans = sorted(filtered.get(day, []))
+        working_hours = (
+            calculate_window_hours(spans, WORKING_DAY_START, WORKING_DAY_END)
+            - args.subtract
+        )
+        total_hours = calculate_total_hours(spans) - args.subtract
+
         table.add_row(
             f"{day.strftime('%a')} {day.isoformat()}",
             MultiBar(HOURS_PER_DAY, spans, width=TIMELINE_WIDTH),
-            f"{calculate_total_hours(spans) - args.subtract:.2f}",
+            f"{working_hours:.2f}",
+            f"{total_hours:.2f}",
         )
 
     Console().print(table)
