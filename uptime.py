@@ -1,11 +1,18 @@
-"""CLI tool to show uptime hours per day on NixOS/systemd systems."""
+"""CLI tool to show work hours per day."""
 
 import argparse
-import re
-import subprocess
+import json
+import os
 import sys
 from collections import defaultdict
-from datetime import date, datetime, timedelta, timezone
+from contextlib import contextmanager
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Unix-only in normal use
+    fcntl = None
 
 from rich.console import Console, ConsoleOptions, RenderResult
 from rich.measure import Measurement
@@ -23,57 +30,125 @@ TIMELINE_LABEL_HOURS = (0, 6, 12, 18, 24)
 
 FULL_BLOCK = "█"
 PARTIAL_BLOCKS = [" ", "▏", "▎", "▍", "▌", "▋", "▊", "▉"]
-JOURNAL_TIMESTAMP_RE = re.compile(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+\S+)")
-
-TZ_ABBREVIATIONS = {
-    "UTC": timezone.utc,
-    "CET": timezone(timedelta(hours=1)),
-    "CEST": timezone(timedelta(hours=2)),
-}
+STATE_ON = "on"
+STATE_OFF = "off"
+VALID_STATES = {STATE_ON, STATE_OFF}
 
 
 def get_week_start(d: date) -> date:
     return d - timedelta(days=d.weekday())
 
 
-def parse_journal_timestamp(raw_timestamp: str) -> datetime | None:
-    try:
-        day, clock, tz_name = raw_timestamp.split()
-        tz_info = TZ_ABBREVIATIONS.get(tz_name, timezone.utc)
-        return datetime.strptime(f"{day} {clock}", "%Y-%m-%d %H:%M:%S").replace(
-            tzinfo=tz_info
-        )
-    except ValueError:
-        return None
+def get_state_dir() -> Path:
+    return Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "daily-hours"
 
 
-def parse_boot_line(line: str) -> tuple[datetime, datetime] | None:
-    timestamps = JOURNAL_TIMESTAMP_RE.findall(line)
-    if len(timestamps) != 2:
-        return None
-
-    start = parse_journal_timestamp(timestamps[0])
-    end = parse_journal_timestamp(timestamps[1])
-    if start is None or end is None:
-        return None
-    return start, end
+def get_event_log_path() -> Path:
+    return get_state_dir() / "work-events.jsonl"
 
 
-def get_boot_sessions() -> list[tuple[datetime, datetime]]:
-    result = subprocess.run(
-        ["journalctl", "--list-boots", "--no-pager"],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        print("Error: Could not read boot logs", file=sys.stderr)
-        sys.exit(1)
+def get_lock_path() -> Path:
+    return get_state_dir() / "work-events.lock"
 
+
+@contextmanager
+def event_log_lock():
+    state_dir = get_state_dir()
+    state_dir.mkdir(parents=True, exist_ok=True)
+    with get_lock_path().open("a") as lock_file:
+        if fcntl is not None:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def parse_iso_datetime(raw: str) -> datetime:
+    value = datetime.fromisoformat(raw)
+    if value.tzinfo is None:
+        raise ValueError("timestamp must include timezone offset")
+    return value
+
+
+def now_local() -> datetime:
+    return datetime.now().astimezone()
+
+
+def read_events(path: Path | None = None) -> list[dict[str, str]]:
+    event_log = path or get_event_log_path()
+    if not event_log.exists():
+        return []
+
+    events = []
+    with event_log.open() as handle:
+        for line_number, line in enumerate(handle, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+                ts = event["ts"]
+                state = event["state"]
+                if state not in VALID_STATES:
+                    raise ValueError(f"invalid state: {state}")
+                parse_iso_datetime(ts)
+            except (KeyError, json.JSONDecodeError, ValueError) as error:
+                raise ValueError(f"invalid event on line {line_number}: {error}") from error
+            events.append(event)
+    return events
+
+
+def current_state(events: list[dict[str, str]] | None = None) -> str:
+    event_list = read_events() if events is None else events
+    if not event_list:
+        return STATE_OFF
+    return event_list[-1]["state"]
+
+
+def append_event(state: str, source: str, timestamp: datetime) -> None:
+    event = {"ts": timestamp.isoformat(timespec="seconds"), "state": state}
+    if source:
+        event["source"] = source
+    with get_event_log_path().open("a") as handle:
+        handle.write(json.dumps(event, separators=(",", ":")) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def set_work_state(state: str, source: str, timestamp: datetime) -> bool:
+    with event_log_lock():
+        events = read_events()
+        if current_state(events) == state:
+            return False
+        append_event(state, source, timestamp)
+        return True
+
+
+def toggle_work_state(source: str, timestamp: datetime) -> str:
+    with event_log_lock():
+        events = read_events()
+        new_state = STATE_OFF if current_state(events) == STATE_ON else STATE_ON
+        append_event(new_state, source, timestamp)
+        return new_state
+
+
+def events_to_sessions(events: list[dict[str, str]], end_open_at: datetime) -> list[tuple[datetime, datetime]]:
     sessions = []
-    for line in result.stdout.splitlines()[1:]:
-        parsed = parse_boot_line(line)
-        if parsed is not None:
-            sessions.append(parsed)
+    active_start = None
+    for event in sorted(events, key=lambda item: parse_iso_datetime(item["ts"])):
+        ts = parse_iso_datetime(event["ts"])
+        state = event["state"]
+        if state == STATE_ON:
+            if active_start is None:
+                active_start = ts
+            continue
+        if active_start is not None and ts > active_start:
+            sessions.append((active_start, ts))
+            active_start = None
+    if active_start is not None and end_open_at > active_start:
+        sessions.append((active_start, end_open_at))
     return sessions
 
 
@@ -220,8 +295,28 @@ def build_timeline_labels(width: int = TIMELINE_WIDTH) -> Text:
     return Text("".join(labels), style="grey58")
 
 
+def add_work_command_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("action", choices=["on", "off", "toggle", "status"])
+    parser.add_argument(
+        "--source",
+        default="cli",
+        help="Caller label persisted with new events (default: cli)",
+    )
+    parser.add_argument(
+        "--at",
+        type=parse_iso_datetime,
+        default=None,
+        help="Timestamp for new event, with timezone offset",
+    )
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Show uptime hours per day")
+    parser = argparse.ArgumentParser(description="Show work hours per day")
+    subparsers = parser.add_subparsers(dest="command")
+
+    work_parser = subparsers.add_parser("work", help="Control work time tracking")
+    add_work_command_args(work_parser)
+
     parser.add_argument(
         "--weeks",
         "-w",
@@ -239,11 +334,37 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def handle_work_command(args: argparse.Namespace) -> None:
+    timestamp = args.at or now_local()
+    try:
+        if args.action == "status":
+            print(current_state())
+        elif args.action == "on":
+            set_work_state(STATE_ON, args.source, timestamp)
+            print(STATE_ON)
+        elif args.action == "off":
+            set_work_state(STATE_OFF, args.source, timestamp)
+            print(STATE_OFF)
+        elif args.action == "toggle":
+            print(toggle_work_state(args.source, timestamp))
+    except ValueError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(1)
+
+
 def main() -> None:
     args = parse_args()
-    sessions = get_boot_sessions()
+    if args.command == "work":
+        handle_work_command(args)
+        return
+
+    try:
+        sessions = events_to_sessions(read_events(), now_local())
+    except ValueError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(1)
     if not sessions:
-        print("No boot sessions found.")
+        print("No work events found.")
         return
 
     today = date.today()
